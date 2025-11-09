@@ -12,6 +12,7 @@ import math
 import os
 from dataclasses import dataclass
 from typing import Optional, Iterator, Tuple
+import sys
 
 import torch
 import torch.nn as nn
@@ -283,10 +284,10 @@ class StreamDataModule(pl.LightningDataModule):
     def train_dataloader(self) -> DataLoader:
         # In DDP, each process has its own accelerator device; tie stream to it.
         device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
-        stream = NoisedMixtureStream(self.cfg, device=device)
+        self.stream = NoisedMixtureStream(self.cfg, device=device)
         # IterableDataset yields already-batched tensors; set batch_size=None
         return DataLoader(
-            stream,
+            self.stream,
             batch_size=None,
             num_workers=0,   # keep 0 for simplicity & determinism; increase if desired
             pin_memory=torch.cuda.is_available(),
@@ -310,7 +311,15 @@ def main():
     else:
         n_gpus = 0
 
-    strategy = "ddp" if n_gpus >= 2 else "auto"
+    # Choose strategy compatible with notebooks (e.g., Kaggle/Jupyter)
+    def _in_interactive_notebook() -> bool:
+        try:
+            from IPython import get_ipython  # noqa: F401
+            return "ipykernel" in sys.modules
+        except Exception:
+            return False
+
+    strategy = "ddp_notebook" if (n_gpus >= 2 and _in_interactive_notebook()) else ("ddp" if n_gpus >= 2 else "auto")
     devices = n_gpus if n_gpus > 0 else None
     accelerator = "gpu" if n_gpus > 0 else "cpu"
 
