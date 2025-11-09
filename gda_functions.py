@@ -161,10 +161,12 @@ class HalfSpaceDenoiser(nn.Module):
     net2:
         eps_theta(x) = 1/(gamma_t sigma) * [ x / sqrt(bar_alpha_t)
                                              - w1 * 1{w0^T x >= 0}
-                                             - w2 * (w3^T x) ]
+                                             - w2 * |w3^T x + b3| ]
     Notes:
       * gamma_t and bar_alpha_t are provided per-batch (shape (B,1)).
       * w3 is constrained to have unit norm (||w3|| = 1).
+      * b3 is a scalar bias term.
+      * The absolute value |w3^T x + b3| is used to predict mixture index i.
       * We use a straight-through estimator for the gate:
             forward: hard = 1_{s>=0}
             backward: d/ds ~ sigmoid(k*s) with slope k (cfg.gate_slope_k).
@@ -185,6 +187,8 @@ class HalfSpaceDenoiser(nn.Module):
             w3_init = torch.randn(d)
             w3_init = w3_init / (w3_init.norm(p=2) + 1e-12)
             self.w3 = nn.Parameter(w3_init)
+            # b3 is the bias term for w3^T x + b3
+            self.b3 = nn.Parameter(torch.zeros(1))
     
     def normalize_w3(self):
         """Normalize w3 to have unit norm."""
@@ -221,8 +225,8 @@ class HalfSpaceDenoiser(nn.Module):
         if self.use_extended:
             # Normalize w3 on-the-fly to ensure unit norm
             w3_normalized = self.w3 / (self.w3.norm(p=2) + 1e-12)
-            proj = torch.matmul(x, w3_normalized).unsqueeze(1)      # (B,1)
-            core = core - proj * self.w2.view(1, -1)                # subtract w2*(w3^T x)
+            proj = torch.abs(torch.matmul(x, w3_normalized) + self.b3.squeeze()).unsqueeze(1)  # (B,1), |w3^T x + b3|
+            core = core - proj * self.w2.view(1, -1)                # subtract w2*|w3^T x + b3|
 
         out = (1.0 / (gamma_t * sigma)) * core                      # broadcast (B,1) -> (B,d)
         return out
@@ -287,26 +291,28 @@ class DiffusionTrainer(pl.LightningModule):
 # ----------------------------
 # Pre-training for w3
 # ----------------------------
-def pretrain_w3(cfg: Config, stream: NoisedMixtureStream, pretrain_steps: int = 500, lr: float = 1e-2) -> torch.Tensor:
+def pretrain_w3(cfg: Config, stream: NoisedMixtureStream, pretrain_steps: int = 500, lr: float = 1e-2) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Pre-train w3 to predict i from x_t using linear regression.
-    Returns the learned w3 vector.
+    Pre-train w3 and b3 to predict i from x_t using linear regression: i ≈ |w3^T x + b3|
+    Returns the learned w3 vector and b3 scalar.
     """
     device = stream.device
     d = cfg.d
     
-    # Initialize w3
+    # Initialize w3 and b3
     w3 = nn.Parameter(torch.randn(d, device=device) / math.sqrt(d))
-    optimizer = torch.optim.Adam([w3], lr=lr)
+    b3 = nn.Parameter(torch.zeros(1, device=device))
+    optimizer = torch.optim.Adam([w3, b3], lr=lr)
     
-    print(f"Pre-training w3 to predict i from x_t for {pretrain_steps} steps...")
+    print(f"Pre-training w3 and b3 to predict i from x_t for {pretrain_steps} steps...")
+    print(f"Using absolute value: i ≈ |w3^T x + b3|")
     
     for step in range(pretrain_steps):
         # Sample a batch
         x_t, eps, t_int, bar_alpha_t, gamma_t, i = stream._sample_batch(cfg.batch_size)
         
-        # Predict i from x_t: i_pred = w3^T x_t
-        i_pred = torch.matmul(x_t, w3)  # (B,)
+        # Predict i from x_t: i_pred = |w3^T x_t + b3|
+        i_pred = torch.abs(torch.matmul(x_t, w3) + b3)  # (B,)
         i_target = i.to(torch.float32)  # (B,)
         
         # MSE loss
@@ -317,10 +323,11 @@ def pretrain_w3(cfg: Config, stream: NoisedMixtureStream, pretrain_steps: int = 
         optimizer.step()
         
         if (step + 1) % 100 == 0 or step == 0:
-            print(f"  Step {step+1}/{pretrain_steps}, Loss: {loss.item():.4f}")
+            print(f"  Step {step+1}/{pretrain_steps}, Loss: {loss.item():.4f}, b3: {b3.item():.4f}")
     
     print(f"Pre-training complete. Final loss: {loss.item():.4f}")
-    return w3.detach()
+    print(f"Learned b3: {b3.item():.4f}")
+    return w3.detach(), b3.detach()
 
 
 # ----------------------------
@@ -331,6 +338,7 @@ def train_diffusion_simple(
     stream: NoisedMixtureStream,
     model: HalfSpaceDenoiser,
     pretrained_w3: Optional[torch.Tensor] = None,
+    pretrained_b3: Optional[torch.Tensor] = None,
     steps: int = 3000,
     lr: float = 1e-2,
     log_every: int = 100
@@ -343,6 +351,7 @@ def train_diffusion_simple(
         stream: NoisedMixtureStream for data generation
         model: HalfSpaceDenoiser model
         pretrained_w3: Optional pre-trained w3 weights
+        pretrained_b3: Optional pre-trained b3 bias
         steps: Number of training steps
         lr: Learning rate
         log_every: Log every N steps
@@ -353,11 +362,15 @@ def train_diffusion_simple(
     device = stream.device
     model = model.to(device)
     
-    # Initialize w3 with pre-trained weights if provided
+    # Initialize w3 and b3 with pre-trained weights if provided
     if pretrained_w3 is not None and cfg.use_extended:
         with torch.no_grad():
             model.w3.copy_(pretrained_w3.to(device))
-        print("Initialized w3 with pre-trained weights")
+            if pretrained_b3 is not None:
+                model.b3.copy_(pretrained_b3.to(device))
+        print(f"Initialized w3 with pre-trained weights")
+        if pretrained_b3 is not None:
+            print(f"Initialized b3 with pre-trained value: {pretrained_b3.item():.4f}")
     
     # Optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=cfg.weight_decay)
