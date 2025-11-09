@@ -461,21 +461,21 @@ def sample_from_diffusion_with_i(
         
         # Compute mean of reverse process
         if t > 1:
-            bar_alpha_t_prev = alpha ** (t - 1)
-            beta_t = 1 - alpha
+            bar_alpha_t_prev = torch.tensor(alpha ** (t - 1), device=device)
+            beta_t = torch.tensor(1 - alpha, device=device)
             
             # Predict x0 from x_t and eps_pred
             x0_pred = (x - torch.sqrt(1 - bar_alpha_t) * eps_pred) / torch.sqrt(bar_alpha_t)
             
             # Compute mean of q(x_{t-1} | x_t, x_0)
             coef1 = torch.sqrt(bar_alpha_t_prev) * beta_t / (1 - bar_alpha_t)
-            coef2 = torch.sqrt(alpha) * (1 - bar_alpha_t_prev) / (1 - bar_alpha_t)
+            coef2 = torch.sqrt(torch.tensor(alpha, device=device)) * (1 - bar_alpha_t_prev) / (1 - bar_alpha_t)
             mean = coef1 * x0_pred + coef2 * x
             
             # Add noise
-            noise = torch.randn_like(x) * sigma
+            noise = torch.randn_like(x)
             var = beta_t * (1 - bar_alpha_t_prev) / (1 - bar_alpha_t) * (sigma ** 2)
-            x = mean + torch.sqrt(var) * noise / sigma
+            x = mean + torch.sqrt(var) * noise
         else:
             # Final step: predict x0
             x = (x - torch.sqrt(1 - bar_alpha_t) * eps_pred) / torch.sqrt(bar_alpha_t)
