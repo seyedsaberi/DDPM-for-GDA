@@ -157,14 +157,14 @@ class HalfSpaceDenoiser(nn.Module):
     Implements (net1) or (net2):
 
     net1:
-        eps_theta(x) = 1/(gamma_t sigma) * [ x / sqrt(bar_alpha_t) - w1 * 1{w0^T x >= 0} - b ]
+        eps_theta(x) = 1/(gamma_t sigma) * [ x / sqrt(bar_alpha_t) - w1 * 1{w0^T x >= 0} ]
     net2:
         eps_theta(x) = 1/(gamma_t sigma) * [ x / sqrt(bar_alpha_t)
                                              - w1 * 1{w0^T x >= 0}
-                                             - w2 * (w3^T x)
-                                             - b ]
+                                             - w2 * (w3^T x) ]
     Notes:
       * gamma_t and bar_alpha_t are provided per-batch (shape (B,1)).
+      * w3 is constrained to have unit norm (||w3|| = 1).
       * We use a straight-through estimator for the gate:
             forward: hard = 1_{s>=0}
             backward: d/ds ~ sigmoid(k*s) with slope k (cfg.gate_slope_k).
@@ -178,11 +178,19 @@ class HalfSpaceDenoiser(nn.Module):
         # Parameters (all are learnable vectors in R^d)
         self.w0 = nn.Parameter(torch.randn(d) / math.sqrt(d))
         self.w1 = nn.Parameter(torch.randn(d) / math.sqrt(d))
-        self.b  = nn.Parameter(torch.zeros(d))
 
         if self.use_extended:
             self.w2 = nn.Parameter(torch.randn(d) / math.sqrt(d))
-            self.w3 = nn.Parameter(torch.randn(d) / math.sqrt(d))
+            # w3 will be normalized to unit norm
+            w3_init = torch.randn(d)
+            w3_init = w3_init / (w3_init.norm(p=2) + 1e-12)
+            self.w3 = nn.Parameter(w3_init)
+    
+    def normalize_w3(self):
+        """Normalize w3 to have unit norm."""
+        if self.use_extended:
+            with torch.no_grad():
+                self.w3.data = self.w3.data / (self.w3.data.norm(p=2) + 1e-12)
 
     def hard_gate_straight_through(self, s: torch.Tensor) -> torch.Tensor:
         """s: (B,), returns (B,) hard gate with ST gradient via sigmoid(k*s)."""
@@ -211,10 +219,10 @@ class HalfSpaceDenoiser(nn.Module):
         core = core - gate * self.w1.view(1, -1)                    # subtract w1 if gate=1
 
         if self.use_extended:
-            proj = torch.matmul(x, self.w3).unsqueeze(1)            # (B,1)
+            # Normalize w3 on-the-fly to ensure unit norm
+            w3_normalized = self.w3 / (self.w3.norm(p=2) + 1e-12)
+            proj = torch.matmul(x, w3_normalized).unsqueeze(1)      # (B,1)
             core = core - proj * self.w2.view(1, -1)                # subtract w2*(w3^T x)
-
-        core = core - self.b.view(1, -1)
 
         out = (1.0 / (gamma_t * sigma)) * core                      # broadcast (B,1) -> (B,d)
         return out
@@ -313,6 +321,91 @@ def pretrain_w3(cfg: Config, stream: NoisedMixtureStream, pretrain_steps: int = 
     
     print(f"Pre-training complete. Final loss: {loss.item():.4f}")
     return w3.detach()
+
+
+# ----------------------------
+# Simple Training Loop (non-Lightning)
+# ----------------------------
+def train_diffusion_simple(
+    cfg: Config,
+    stream: NoisedMixtureStream,
+    model: HalfSpaceDenoiser,
+    pretrained_w3: Optional[torch.Tensor] = None,
+    steps: int = 3000,
+    lr: float = 1e-2,
+    log_every: int = 100
+) -> HalfSpaceDenoiser:
+    """
+    Simple training loop without PyTorch Lightning.
+    
+    Args:
+        cfg: Config object
+        stream: NoisedMixtureStream for data generation
+        model: HalfSpaceDenoiser model
+        pretrained_w3: Optional pre-trained w3 weights
+        steps: Number of training steps
+        lr: Learning rate
+        log_every: Log every N steps
+        
+    Returns:
+        Trained model
+    """
+    device = stream.device
+    model = model.to(device)
+    
+    # Initialize w3 with pre-trained weights if provided
+    if pretrained_w3 is not None and cfg.use_extended:
+        with torch.no_grad():
+            model.w3.copy_(pretrained_w3.to(device))
+        print("Initialized w3 with pre-trained weights")
+    
+    # Optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=cfg.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
+    
+    print(f"\nTraining diffusion model for {steps} steps...")
+    model.train()
+    
+    for step in range(steps):
+        # Sample batch
+        x_t, eps, t_int, bar_alpha_t, gamma_t, i = stream._sample_batch(cfg.batch_size)
+        
+        # Forward pass
+        eps_pred = model(x_t, bar_alpha_t, gamma_t, cfg.sigma)
+        
+        # Loss: E_t E_{X0,eps} [ gamma_t * ||eps - eps_pred||^2 ]
+        diff = eps - eps_pred
+        loss = (gamma_t * (diff * diff).sum(dim=1, keepdim=True)).mean()
+        
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        
+        # Gradient clipping
+        if cfg.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
+        
+        optimizer.step()
+        scheduler.step()
+        
+        # Normalize w3 after each optimizer step
+        model.normalize_w3()
+        
+        # Logging
+        if (step + 1) % log_every == 0 or step == 0:
+            with torch.no_grad():
+                mse_eps = F.mse_loss(eps_pred, eps)
+                mean_gate = (torch.matmul(x_t, model.w0) >= 0).to(torch.float32).mean()
+                if cfg.use_extended:
+                    w3_norm = model.w3.norm(p=2).item()
+                    print(f"  Step {step+1}/{steps} | Loss: {loss.item():.4f} | MSE: {mse_eps.item():.4f} | "
+                          f"Gate: {mean_gate.item():.3f} | ||w3||: {w3_norm:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
+                else:
+                    print(f"  Step {step+1}/{steps} | Loss: {loss.item():.4f} | MSE: {mse_eps.item():.4f} | "
+                          f"Gate: {mean_gate.item():.3f} | LR: {scheduler.get_last_lr()[0]:.6f}")
+    
+    print("Training complete!")
+    return model
 
 
 # ----------------------------
