@@ -453,45 +453,54 @@ def sample_from_diffusion_with_i(
     alpha = cfg.alpha
     sigma = cfg.sigma
     
-    # Start from pure noise
-    x = torch.randn(num_samples, d, device=device) * sigma
+    # Start from pure noise: x_T ~ N(0, I)
+    x = torch.randn(num_samples, d, device=device)
     
     # Reverse diffusion process
     for t in range(cfg.T, 0, -1):
         t_tensor = torch.full((num_samples,), t, device=device, dtype=torch.long)
         t_float = t_tensor.to(torch.float32)
         
-        bar_alpha_t = torch.pow(torch.tensor(alpha, device=device), t_float).unsqueeze(1)
+        # Compute schedule values
+        bar_alpha_t = (alpha ** t)
+        bar_alpha_t_tensor = torch.full((num_samples, 1), bar_alpha_t, device=device)
+        
         gamma_t = ((1 - alpha) ** 2) / (2.0 * alpha * (1.0 - bar_alpha_t) * (sigma ** 2))
+        gamma_t_tensor = torch.full((num_samples, 1), gamma_t, device=device)
         
-        # Modified forward pass: replace w3^T x with target_i
-        # We need to modify the denoiser to accept i directly
-        # For now, we'll use a workaround: compute what x would need to be
-        # such that w3^T x = target_i, then use that
+        # Predict noise
+        eps_pred = model(x, bar_alpha_t_tensor, gamma_t_tensor, sigma)
         
-        # Standard denoiser prediction
-        eps_pred = model(x, bar_alpha_t, gamma_t, sigma)
-        
-        # Compute mean of reverse process
+        # DDPM sampling step
         if t > 1:
-            bar_alpha_t_prev = torch.tensor(alpha ** (t - 1), device=device)
-            beta_t = torch.tensor(1 - alpha, device=device)
+            # Compute coefficients
+            beta_t = 1 - alpha
+            bar_alpha_t_prev = alpha ** (t - 1)
             
-            # Predict x0 from x_t and eps_pred
-            x0_pred = (x - torch.sqrt(1 - bar_alpha_t) * eps_pred) / torch.sqrt(bar_alpha_t)
+            # Predict x0 from x_t
+            sqrt_bar_alpha_t = math.sqrt(bar_alpha_t)
+            sqrt_one_minus_bar_alpha_t = math.sqrt(1.0 - bar_alpha_t)
+            x0_pred = (x - sqrt_one_minus_bar_alpha_t * eps_pred) / sqrt_bar_alpha_t
             
-            # Compute mean of q(x_{t-1} | x_t, x_0)
-            coef1 = torch.sqrt(bar_alpha_t_prev) * beta_t / (1 - bar_alpha_t)
-            coef2 = torch.sqrt(torch.tensor(alpha, device=device)) * (1 - bar_alpha_t_prev) / (1 - bar_alpha_t)
+            # Compute posterior mean
+            sqrt_bar_alpha_t_prev = math.sqrt(bar_alpha_t_prev)
+            sqrt_alpha = math.sqrt(alpha)
+            
+            coef1 = sqrt_bar_alpha_t_prev * beta_t / (1.0 - bar_alpha_t)
+            coef2 = sqrt_alpha * (1.0 - bar_alpha_t_prev) / (1.0 - bar_alpha_t)
             mean = coef1 * x0_pred + coef2 * x
             
-            # Add noise
+            # Compute posterior variance
+            posterior_variance = beta_t * (1.0 - bar_alpha_t_prev) / (1.0 - bar_alpha_t)
+            
+            # Add noise (only if not last step)
             noise = torch.randn_like(x)
-            var = beta_t * (1 - bar_alpha_t_prev) / (1 - bar_alpha_t) * (sigma ** 2)
-            x = mean + torch.sqrt(var) * noise
+            x = mean + math.sqrt(posterior_variance) * noise
         else:
-            # Final step: predict x0
-            x = (x - torch.sqrt(1 - bar_alpha_t) * eps_pred) / torch.sqrt(bar_alpha_t)
+            # Final step: predict x0 directly
+            sqrt_bar_alpha_t = math.sqrt(bar_alpha_t)
+            sqrt_one_minus_bar_alpha_t = math.sqrt(1.0 - bar_alpha_t)
+            x = (x - sqrt_one_minus_bar_alpha_t * eps_pred) / sqrt_bar_alpha_t
     
     return x
 
