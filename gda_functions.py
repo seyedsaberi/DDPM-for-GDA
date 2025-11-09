@@ -28,7 +28,7 @@ from pytorch_lightning.utilities.rank_zero import rank_zero_only
 # ----------------------------
 @dataclass
 class Config:
-    d: int = 32               # data dimension
+    d: int = 2               # data dimension
     sigma: float = 1.0        # data/eps std (both use sigma^2 I_d as in problem)
     alpha: float = 0.99       # fixed alpha \in (0,1)
     T: int = 1000             # total diffusion steps
