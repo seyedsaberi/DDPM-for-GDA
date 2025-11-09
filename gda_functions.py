@@ -286,11 +286,12 @@ class StreamDataModule(pl.LightningDataModule):
         device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
         self.stream = NoisedMixtureStream(self.cfg, device=device)
         # IterableDataset yields already-batched tensors; set batch_size=None
+        # pin_memory=False because tensors are already created on the target device
         return DataLoader(
             self.stream,
             batch_size=None,
             num_workers=0,   # keep 0 for simplicity & determinism; increase if desired
-            pin_memory=torch.cuda.is_available(),
+            pin_memory=False,
         )
 
 
