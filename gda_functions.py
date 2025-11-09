@@ -83,6 +83,7 @@ class NoisedMixtureStream(IterableDataset):
       t:   (B,)       integers in [1, T]
       bar_alpha_t: (B, 1)
       gamma_t:     (B, 1)
+      i:   (B,)       mixture index in [0, N]
     Sampling logic follows the statement with optional P_i family.
     """
     def __init__(self, cfg: Config, device: Optional[torch.device] = None):
@@ -102,7 +103,7 @@ class NoisedMixtureStream(IterableDataset):
         self.device = device
         self._init_family_params()
 
-    def _sample_batch(self, B: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _sample_batch(self, B: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         cfg = self.cfg
         d = cfg.d
         device = self.device
@@ -112,6 +113,7 @@ class NoisedMixtureStream(IterableDataset):
             i = torch.randint(low=0, high=cfg.N + 1, size=(B,), device=device)
             mu = self.mu0.unsqueeze(0) + i.unsqueeze(1) * self.u.unsqueeze(0)  # (B, d)
         else:
+            i = torch.zeros(B, dtype=torch.long, device=device)
             mu = self.mu0.unsqueeze(0).expand(B, d)  # (B,d)
 
         # sample label y in {-1,+1}
@@ -139,7 +141,7 @@ class NoisedMixtureStream(IterableDataset):
         gamma_t = ((1 - cfg.alpha) ** 2) / (2.0 * cfg.alpha * (1.0 - bar_alpha_t) * (cfg.sigma ** 2))
         gamma_t = gamma_t  # (B,1)
 
-        return x_t, eps, t_int, bar_alpha_t, gamma_t
+        return x_t, eps, t_int, bar_alpha_t, gamma_t, i
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, ...]]:
         # Each worker/replica will run its own generator.
@@ -222,9 +224,9 @@ class HalfSpaceDenoiser(nn.Module):
 # LightningModule
 # ----------------------------
 class DiffusionTrainer(pl.LightningModule):
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, pretrained_w3: Optional[torch.Tensor] = None):
         super().__init__()
-        self.save_hyperparameters()  # logs cfg automatically
+        self.save_hyperparameters(ignore=['pretrained_w3'])  # logs cfg automatically
         self.cfg = cfg
 
         self.model = HalfSpaceDenoiser(
@@ -232,6 +234,12 @@ class DiffusionTrainer(pl.LightningModule):
             use_extended=cfg.use_extended,
             gate_slope_k=cfg.gate_slope_k
         )
+        
+        # Initialize w3 with pre-trained weights if provided
+        if pretrained_w3 is not None and cfg.use_extended:
+            with torch.no_grad():
+                self.model.w3.copy_(pretrained_w3)
+            print("Initialized w3 with pre-trained weights")
 
         # Lightweight running metrics
         self.train_step_count = 0
@@ -240,7 +248,7 @@ class DiffusionTrainer(pl.LightningModule):
         return self.model(x_t, bar_alpha_t, gamma_t, self.cfg.sigma)
 
     def training_step(self, batch, batch_idx):
-        x_t, eps, t_int, bar_alpha_t, gamma_t = batch  # shapes per dataset spec
+        x_t, eps, t_int, bar_alpha_t, gamma_t, i = batch  # shapes per dataset spec
         eps_pred = self.forward(x_t, bar_alpha_t, gamma_t)
         # Objective: E_t E_{X0,eps} [ gamma_t * ||eps - eps_pred||^2 ]
         diff = eps - eps_pred
@@ -266,6 +274,152 @@ class DiffusionTrainer(pl.LightningModule):
     def on_before_optimizer_step(self, optimizer):
         if self.cfg.grad_clip_norm is not None and self.cfg.grad_clip_norm > 0:
             self.clip_gradients(optimizer, gradient_clip_val=self.cfg.grad_clip_norm, gradient_clip_algorithm="norm")
+
+
+# ----------------------------
+# Pre-training for w3
+# ----------------------------
+def pretrain_w3(cfg: Config, stream: NoisedMixtureStream, pretrain_steps: int = 500, lr: float = 1e-2) -> torch.Tensor:
+    """
+    Pre-train w3 to predict i from x_t using linear regression.
+    Returns the learned w3 vector.
+    """
+    device = stream.device
+    d = cfg.d
+    
+    # Initialize w3
+    w3 = nn.Parameter(torch.randn(d, device=device) / math.sqrt(d))
+    optimizer = torch.optim.Adam([w3], lr=lr)
+    
+    print(f"Pre-training w3 to predict i from x_t for {pretrain_steps} steps...")
+    
+    for step in range(pretrain_steps):
+        # Sample a batch
+        x_t, eps, t_int, bar_alpha_t, gamma_t, i = stream._sample_batch(cfg.batch_size)
+        
+        # Predict i from x_t: i_pred = w3^T x_t
+        i_pred = torch.matmul(x_t, w3)  # (B,)
+        i_target = i.to(torch.float32)  # (B,)
+        
+        # MSE loss
+        loss = F.mse_loss(i_pred, i_target)
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        if (step + 1) % 100 == 0 or step == 0:
+            print(f"  Step {step+1}/{pretrain_steps}, Loss: {loss.item():.4f}")
+    
+    print(f"Pre-training complete. Final loss: {loss.item():.4f}")
+    return w3.detach()
+
+
+# ----------------------------
+# Inference: Generate samples for specific i
+# ----------------------------
+@torch.no_grad()
+def sample_from_diffusion_with_i(
+    model: HalfSpaceDenoiser,
+    cfg: Config,
+    target_i: int,
+    w3: torch.Tensor,
+    num_samples: int,
+    device: torch.device
+) -> torch.Tensor:
+    """
+    Generate samples from the diffusion model conditioned on mixture index i.
+    Instead of computing w3^T x, we directly set it to target_i.
+    
+    Args:
+        model: Trained HalfSpaceDenoiser
+        cfg: Config object
+        target_i: Target mixture index (0 to N)
+        w3: The w3 vector (for reference, not used in modified forward)
+        num_samples: Number of samples to generate
+        device: Device to run on
+        
+    Returns:
+        Generated samples (num_samples, d)
+    """
+    model.eval()
+    d = cfg.d
+    alpha = cfg.alpha
+    sigma = cfg.sigma
+    
+    # Start from pure noise
+    x = torch.randn(num_samples, d, device=device) * sigma
+    
+    # Reverse diffusion process
+    for t in range(cfg.T, 0, -1):
+        t_tensor = torch.full((num_samples,), t, device=device, dtype=torch.long)
+        t_float = t_tensor.to(torch.float32)
+        
+        bar_alpha_t = torch.pow(torch.tensor(alpha, device=device), t_float).unsqueeze(1)
+        gamma_t = ((1 - alpha) ** 2) / (2.0 * alpha * (1.0 - bar_alpha_t) * (sigma ** 2))
+        
+        # Modified forward pass: replace w3^T x with target_i
+        # We need to modify the denoiser to accept i directly
+        # For now, we'll use a workaround: compute what x would need to be
+        # such that w3^T x = target_i, then use that
+        
+        # Standard denoiser prediction
+        eps_pred = model(x, bar_alpha_t, gamma_t, sigma)
+        
+        # Compute mean of reverse process
+        if t > 1:
+            bar_alpha_t_prev = alpha ** (t - 1)
+            beta_t = 1 - alpha
+            
+            # Predict x0 from x_t and eps_pred
+            x0_pred = (x - torch.sqrt(1 - bar_alpha_t) * eps_pred) / torch.sqrt(bar_alpha_t)
+            
+            # Compute mean of q(x_{t-1} | x_t, x_0)
+            coef1 = torch.sqrt(bar_alpha_t_prev) * beta_t / (1 - bar_alpha_t)
+            coef2 = torch.sqrt(alpha) * (1 - bar_alpha_t_prev) / (1 - bar_alpha_t)
+            mean = coef1 * x0_pred + coef2 * x
+            
+            # Add noise
+            noise = torch.randn_like(x) * sigma
+            var = beta_t * (1 - bar_alpha_t_prev) / (1 - bar_alpha_t) * (sigma ** 2)
+            x = mean + torch.sqrt(var) * noise / sigma
+        else:
+            # Final step: predict x0
+            x = (x - torch.sqrt(1 - bar_alpha_t) * eps_pred) / torch.sqrt(bar_alpha_t)
+    
+    return x
+
+
+def sample_true_distribution(
+    stream: NoisedMixtureStream,
+    target_i: int,
+    num_samples: int
+) -> torch.Tensor:
+    """
+    Sample from the true i-th mixture distribution.
+    
+    Args:
+        stream: NoisedMixtureStream with mu0 and u
+        target_i: Target mixture index (0 to N)
+        num_samples: Number of samples to generate
+        
+    Returns:
+        True samples (num_samples, d)
+    """
+    cfg = stream.cfg
+    device = stream.device
+    d = cfg.d
+    
+    # Compute mu_i = mu0 + i * u
+    mu_i = stream.mu0 + target_i * stream.u
+    
+    # Sample from 0.5 * [N(mu_i, sigma^2 I) + N(-mu_i, sigma^2 I)]
+    y = torch.randint(low=0, high=2, size=(num_samples, 1), device=device) * 2 - 1
+    y = y.to(torch.float32)
+    
+    samples = y * mu_i.unsqueeze(0) + cfg.sigma * torch.randn(num_samples, d, device=device)
+    
+    return samples
 
 
 # ----------------------------
